@@ -1,0 +1,17 @@
+Flagged for later when you have real data:
+
+K-means multi-center anomaly detection (reduces false positives on border cases)
+Lazy tab rendering (stops heatmap/animation rebuilding on tab switch)
+Test pipeline runtime at actual 1M+ row scale
+Logging time that each function takes.
+
+Good call — keep a running list. Here's what we have so far for "next time":
+Deferred improvements:
+
+K-means multi-center anomaly detection (reduces false positives on border cases)
+Lazy tab rendering for heatmap (stops it rebuilding on tab switch)
+Performance timing/profiling panel — restore what you had, but as a proper collapsible debug panel showing per-section render times. Good for monitoring at scale.
+Test pipeline runtime at actual 1M+ row scale
+
+The timing panel is worth doing properly when you revisit — rather than just restoring what you had, build it as a st.expander("Performance", expanded=False) at the bottom of the page that shows a mini flame chart like the one you shared. That way it's always available to analysts who want it but out of the way for normal use.
+Anything else to add to the list, or are you good for now?
