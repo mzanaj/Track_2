@@ -212,58 +212,133 @@ def cluster_grid(df: pd.DataFrame, cell_meters: float = 10) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def cluster_h3(df: pd.DataFrame, resolution: int = 12) -> pd.DataFrame:
-    """
-    H3 hexagonal grid clustering — strict, O(n), production-grade.
-
-    Each lat/lon maps deterministically to an H3 hexagon at the given
-    resolution. Points sharing a hexagon share a location_id.
-
-    Resolution guide:
-        res 10 → ~65m  (neighborhood)
-        res 11 → ~25m  (city block)
-        res 12 → ~10m  ← recommended for this app
-        res 13 →  ~4m  (doorway)
-
-    Why hexagons beat squares:
-        Every hexagon neighbor is equidistant from center — squares aren't
-        (diagonal neighbors are √2 further). Hexagons tile more smoothly
-        across geography with less directional bias.
-
-    Args:
-        df:          DataFrame with 'lat' and 'lon' columns
-        resolution:  H3 resolution level (0=coarse, 15=fine)
-
-    Returns:
-        DataFrame with 'location_id' (H3 hex string) and
-        'location_label' columns added
-
-    Raises:
-        ImportError: if h3 library is not installed (pip install h3)
-    """
     try:
         import h3
     except ImportError:
-        raise ImportError(
-            "H3 library not installed. Run: pip install h3\n"
-            "Falling back to grid clustering is recommended if H3 unavailable."
-        )
+        raise ImportError("pip install h3")
 
     df = df.copy()
-
-    # Vectorized H3 cell assignment
     df["location_id"] = [
         h3.latlng_to_cell(lat, lon, resolution)
         for lat, lon in zip(df["lat"], df["lon"])
     ]
 
-    # Centroid of each occupied hex cell
-    centers   = df.groupby("location_id")[["lat", "lon"]].mean()
-    label_map = {
-        cid: f"({row['lat']:.5f}, {row['lon']:.5f})"
-        for cid, row in centers.iterrows()
-    }
-    df["location_label"] = df["location_id"].map(label_map)
+    # ── Fix 1: Use stable hex center, not mean of points ─────────────
+    unique_hexes  = df["location_id"].unique()
+    center_coords = {hid: h3.cell_to_latlng(hid) for hid in unique_hexes}
+    df["location_label"] = df["location_id"].map(
+        lambda x: f"({center_coords[x][0]:.5f}, {center_coords[x][1]:.5f})"
+    )
     return df
+
+
+def get_convergences_h3(
+    df: pd.DataFrame,
+    resolution: int = 12,
+    max_minutes: float = 120,
+    include_neighbors: bool = True,
+    neighbor_rings: int = 1,
+) -> pd.DataFrame:
+    try:
+        import h3
+    except ImportError:
+        raise ImportError("pip install h3")
+
+    df = df.copy()
+    df["hex"] = [
+        h3.latlng_to_cell(lat, lon, resolution)
+        for lat, lon in zip(df["lat"], df["lon"])
+    ]
+    df = df.sort_values("last_seen").reset_index(drop=True)
+
+    events          = []
+    processed_pairs = set()
+
+    for hex_cell, group in df.groupby("hex"):
+        cells_to_check = {hex_cell}
+        if include_neighbors:
+            cells_to_check.update(h3.grid_disk(hex_cell, neighbor_rings))
+
+        neighborhood = df[df["hex"].isin(cells_to_check)]
+
+        # ── Fix 3: Time window pre-filter ─────────────────────────────
+        max_ts = neighborhood["last_seen"].max()
+        min_ts = neighborhood["last_seen"].min()
+        window = pd.Timedelta(minutes=max_minutes)
+        neighborhood = neighborhood[
+            (neighborhood["last_seen"] >= min_ts) &
+            (neighborhood["last_seen"] <= max_ts)
+        ]
+
+        targets_in_area = neighborhood["target"].unique()
+        if len(targets_in_area) < 2:
+            continue
+
+        for i, t1 in enumerate(sorted(targets_in_area)):
+            for t2 in sorted(targets_in_area)[i+1:]:
+                g1 = neighborhood[neighborhood["target"] == t1]
+                g2 = neighborhood[neighborhood["target"] == t2]
+
+                for _, r1 in g1.iterrows():
+                    for _, r2 in g2.iterrows():
+                        dt_min = abs(
+                            (r1["last_seen"] - r2["last_seen"]).total_seconds()
+                        ) / 60
+
+                        if dt_min > max_minutes:
+                            continue
+
+                        # ── Fix 4: Key on timestamps not hex ──────────
+                        pair_key = (
+                            min(t1, t2), max(t1, t2),
+                            str(r1["last_seen"]), str(r2["last_seen"])
+                        )
+                        if pair_key in processed_pairs:
+                            continue
+                        processed_pairs.add(pair_key)
+
+                        distance_type = (
+                            "same_cell"
+                            if r1["hex"] == r2["hex"]
+                            else "adjacent_cell"
+                        )
+                        events.append({
+                            "target_a":      t1,
+                            "target_b":      t2,
+                            "time_a":        r1["last_seen"],
+                            "time_b":        r2["last_seen"],
+                            "dt_minutes":    round(dt_min, 1),
+                            "hex_cell":      hex_cell,
+                            "distance_type": distance_type,
+                            "lat":           round((r1["lat"] + r2["lat"]) / 2, 6),
+                            "lon":           round((r1["lon"] + r2["lon"]) / 2, 6),
+                        })
+
+    return pd.DataFrame(events).drop_duplicates(
+        subset=["target_a", "target_b", "time_a", "time_b"]
+    ).reset_index(drop=True)
+
+
+def _meters_to_h3_resolution(meters: float) -> int:
+    """
+    Conservative — returns finest resolution where hex edge ≤ requested meters.
+    Never groups points further apart than the user requested.
+    """
+    resolution_map = {
+        15: 0.5,
+        14: 1.2,
+        13: 3.2,
+        12: 9.4,
+        11: 25.0,
+        10: 65.9,
+        9:  174.4,
+        8:  461.4,
+    }
+    best = 8
+    for res, edge_m in resolution_map.items():
+        if edge_m <= meters and res > best:
+            best = res
+    return best
 
 
 # ══════════════════════════════════════════════════════════════════════════════
