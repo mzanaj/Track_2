@@ -447,3 +447,28 @@ conv_df = get_convergences_h3(
 )
 # Note: conv_df now has 'distance_type' column — "same_cell" or "adjacent_cell"
 # You can use this to color-code confidence in the convergence map
+
+
+import h3
+
+def get_hex_geojson(hex_id: str):
+    """
+    Returns a GeoJSON-style geometry for a given H3 cell.
+    Useful for plotting on Folium or Plotly maps.
+    """
+    # Get the 6 corners of the hexagon
+    boundary = h3.cell_to_boundary(hex_id)
+    
+    # H3 returns (lat, lon), but GeoJSON needs [lon, lat]
+    # We also need to close the loop by repeating the first point
+    flipped_boundary = [[lon, lat] for lat, lon in boundary]
+    flipped_boundary.append(flipped_boundary[0]) 
+    
+    return {
+        "type": "Feature",
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [flipped_boundary]
+        },
+        "properties": {"hex_id": hex_id}
+    }
