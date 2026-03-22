@@ -1,0 +1,862 @@
+================================================================================
+GEOMAP — ANALYTICAL METHODS & WORKFLOW REFERENCE
+Algorithms, Techniques, and the Why Behind Each Decision
+Version 1.0 · 2026
+================================================================================
+
+
+================================================================================
+1. THE BIG PICTURE
+================================================================================
+
+Core question: Was Target A at the same place as Target B, and when?
+
+Everything in the system — every algorithm, every table, every chart — is a
+variation of this question applied at different scales of space, time, and
+confidence.
+
+
+1.1 THE ANALYTICAL HIERARCHY
+─────────────────────────────
+
+  BIG PICTURE
+  Who are these targets? Where do they live and work? How do they relate?
+  → Target intelligence cards, network graph, shared location analysis
+
+  MEDIUM PICTURE
+  What patterns exist? Where do they go? When active? Who do they meet?
+  → Dwell detection, routines, convergence detection, temporal analysis
+
+  LITTLE PICTURE
+  Is this specific sighting normal or anomalous? Does this point belong
+  to a known cluster?
+  → Home range + anomaly detection, cluster verification, haversine confirm
+
+
+1.2 THE DATA PIPELINE
+──────────────────────
+
+  sightings.csv
+      ↓
+  python -m utils.precompute   (run manually when data changes)
+      ↓
+  data/precomputed/*.parquet   (fast binary reads, typed, compact)
+      ↓
+  Streamlit pages              (read-only consumers, zero computation on load)
+
+  Parquet is used throughout because it is typed, binary, 3–10x smaller
+  than CSV, and requires no parsing. Datetime columns remain datetime.
+
+
+1.3 THE FOUNDATIONAL ASSUMPTION
+────────────────────────────────
+
+  CRITICAL: Clustering is the foundation. If clustering is wrong,
+  everything downstream is wrong.
+
+  Every analytical feature — dwell detection, shared locations, routines,
+  the network graph, target summaries — is aggregation on top of a single
+  column: location_id. The quality of that column determines the quality
+  of every insight the system produces.
+
+
+================================================================================
+2. LOCATION CLUSTERING
+================================================================================
+
+Clustering assigns a location_id to every sighting. Points with the same
+location_id are treated as the same place by all downstream analysis.
+
+
+2.1 THE CHAINING PROBLEM
+─────────────────────────
+
+DBSCAN (the original approach) has a fundamental flaw:
+
+  A point joins a cluster if within eps of ANY existing member —
+  not necessarily the seed point.
+
+  Example:
+    Point A ── 8m ── Point B ── 9m ── Point C
+
+  A and C are 17m apart but end up in the same cluster because:
+    A and B are within 10m → same cluster
+    B and C are within 10m → same cluster
+    Therefore A, B, C → same cluster
+
+  In theory, a chain could span 1000m with each pair only 9m apart.
+  For a surveillance application where "same location" has operational
+  and potentially legal significance, this is unacceptable.
+
+
+2.2 ALGORITHM COMPARISON
+─────────────────────────
+
+  Method                     | Chaining | Speed @1M  | Verdict
+  ─────────────────────────────────────────────────────────────────────
+  DBSCAN                     | YES ❌   | 30–90s     | Wrong for strict proximity
+  Agglomerative (single)     | YES ❌   | O(n²) slow | Same chaining problem
+  K-Means                    | No       | Fast       | Needs K upfront. Wrong tool.
+  Square grid hashing        | No       | O(n) fast  | Boundary effect. Directional bias.
+  H3 Hexagonal (CHOSEN)      | No       | O(n) <1s   | Production-grade. Recommended.
+
+
+2.3 H3 HEXAGONAL INDEXING
+──────────────────────────
+
+H3 (Uber's hexagonal hierarchical geospatial indexing system) divides
+the entire Earth into a hierarchical hexagonal grid. Every lat/lon maps
+to exactly one hex cell at each resolution level.
+
+Why hexagons beat squares:
+  Every hexagon neighbor is equidistant from its center. Square grid
+  corners are √2 × cell_size further than edge neighbors, creating
+  directional bias. Hexagons tile more smoothly across geography with
+  6 equidistant neighbors vs 8 unequal ones for squares.
+
+Resolution Reference:
+  Resolution 13  →  ~4m     Doorway precision. GPS rarely this accurate.
+  Resolution 12  → ~10m     RECOMMENDED. Matches GPS accuracy in urban areas.
+  Resolution 11  → ~25m     Building block scale.
+  Resolution 10  → ~65m     City block scale.
+  Resolution  9  → ~174m    Used for convergence detection pre-filtering.
+  Resolution  8  → ~461m    Neighborhood scale.
+
+Why resolution 12 (~10m)?
+  GPS accuracy in open urban areas: 3–5m.
+  GPS accuracy in dense urban canyons: 10–15m.
+  Going finer than sensor accuracy produces false splits with no
+  analytical benefit.
+
+
+2.4 THE NEIGHBORHOOD ID PROBLEM
+─────────────────────────────────
+
+A single hex comparison misses points near cell boundaries. Two targets
+8m apart straddling a hex edge are in different clusters with different
+location_ids.
+
+  SOLUTION: neighborhood_id
+
+  Assign each sighting the lexicographically smallest hex in its k=1
+  ring (itself + 6 neighbors). Points in adjacent hexes get the same
+  neighborhood_id and are treated as the same location.
+
+  Formula:
+    neighborhood_id = min(h3.grid_disk(location_id, k=1))
+
+  This is deterministic — same input always produces the same
+  neighborhood_id. All downstream analysis groups by neighborhood_id
+  (not location_id), giving ~20m boundary tolerance without any chaining.
+
+All downstream features (dwell, shared locations, routines, network
+graph) group by neighborhood_id.
+
+
+2.5 EXTREME BEHAVIORS
+──────────────────────
+
+  SCENARIO                      | EFFECT
+  ──────────────────────────────────────────────────────────────────────
+  Resolution too fine (res 14)  | GPS noise → thousands of singleton
+                                |   clusters. Dwell finds nothing.
+                                |   Network graph meaningless.
+  Resolution too coarse (res 10)| City block = one cluster. Targets in
+                                |   different buildings appear co-located.
+                                |   Shared locations flooded with false +.
+  k=0 (no neighborhood expand)  | Boundary misses. Two targets 8m apart
+                                |   at hex edge = different locations.
+                                |   Network undercount relationships.
+  k=2 or higher neighborhood    | Overcounting. Points 30–40m apart
+                                |   treated as same location.
+                                |   Network over-connected, noisy.
+  k=1 (CHOSEN)                  | ~20m boundary tolerance. Matches
+                                |   sensor accuracy. Correct behavior.
+
+
+================================================================================
+3. CONVERGENCE DETECTION
+================================================================================
+
+Convergence flags moments when two different targets were recorded at the
+same location within a defined time window — a potential meeting or
+coordinated movement event.
+
+
+3.1 THE TWO-CONDITION RULE
+───────────────────────────
+
+  Two targets converge when:
+    distance(p1, p2) ≤ D meters
+    AND
+    |time(p1) − time(p2)| ≤ T minutes
+
+  Both conditions must be true simultaneously.
+  A shared location 3 days apart is NOT convergence.
+
+
+3.2 THE ORIGINAL PROBLEM: O(n²)
+─────────────────────────────────
+
+The naive approach compares every sighting against every other sighting
+across all target pairs. With 1M rows and 12 targets, this produces
+~144M comparisons — taking minutes.
+
+
+3.3 FILTER THEN VERIFY
+────────────────────────
+
+The production approach uses a two-stage pipeline:
+
+  Step 1: H3 pre-filter (O(n))
+    Assign each sighting a coarse hex (res=9, ~174m).
+    Expand to k=2 neighbor ring (~600m coverage).
+    Group all sightings by neighborhood.
+    Eliminates ~99% of impossible pairs before any distance calculation.
+
+  Step 2: Haversine verify (O(candidates))
+    Run exact distance calculation only on hex-neighborhood candidates.
+    Confirms actual distance in meters for each candidate.
+    A tiny fraction of the original n².
+
+  Step 3: Store results (once)
+    Persist all pairs ≤ 500m and ≤ 240 min to parquet.
+    Includes exact distance_m and dt_minutes columns.
+
+  Step 4: UI filter (O(1))
+    User selects threshold (10/25/50/100/200/500m, 15–240 min).
+    Filter precomputed table. Instant, no recomputation.
+
+Why res=9 for pre-filter:
+  At res=9, each hex is ~174m across. With k=2 neighbor rings, coverage
+  extends ~600m — comfortably beyond the 500m maximum detection
+  threshold. k=2 is the minimum needed; k=3 adds unnecessary computation.
+
+Key insight — subsets:
+  All pairs ≤ 10m ⊂ all pairs ≤ 50m ⊂ all pairs ≤ 500m.
+  Pre-compute once at 500m. Every smaller threshold is an instant filter.
+
+
+3.4 DISTANCE TYPE CLASSIFICATION
+──────────────────────────────────
+
+  same_cell      Both sightings in identical H3 hex (res=12). Within
+                 ~10m. Highest confidence.
+
+  adjacent_cell  Different hexes, but in each other's k=1 ring.
+                 Within ~10–20m. High confidence.
+
+  neighborhood   Within coarse hex neighborhood (res=9, k=2).
+                 Haversine-verified ≤ 500m. Lower confidence —
+                 use for broader pattern detection.
+
+
+3.5 EXTREME BEHAVIORS
+──────────────────────
+
+  SCENARIO                          | EFFECT
+  ──────────────────────────────────────────────────────────────────────
+  Max distance = 10m                | Only same-cell matches. High
+                                    |   precision. May miss real meetings
+                                    |   where GPS error splits hex boundary.
+  Max distance = 500m               | Catches broad area proximity. Risk
+                                    |   of false positives in dense areas.
+  Max time = 15 min                 | Only near-simultaneous presence.
+                                    |   Misses staggered arrivals/departures.
+  Max time = 240 min                | Same general time period. Useful
+                                    |   for identifying shared areas, not
+                                    |   just precise meetings.
+  High-density areas (airports etc.)| Many targets in same hex. Table
+                                    |   floods. Use smaller threshold
+                                    |   to reduce noise.
+
+
+================================================================================
+4. HOME RANGE & ANOMALY DETECTION
+================================================================================
+
+Identifies sightings that fall outside a target's normal movement pattern.
+
+
+4.1 WHY MULTI-CLUSTER MATTERS
+───────────────────────────────
+
+A target with two regular locations (home + work) creates a fundamental
+problem for single-center detection:
+
+  Single-center failure:
+    Center computed between home and work.
+    Standard deviation spans both locations.
+    True anomalies absorbed into the large std.
+    Points between home and work incorrectly flagged as anomalies.
+
+  Solution: find each cluster independently. Measure anomaly distance
+  against the nearest cluster center — not a global center.
+
+
+4.2 MULTI-CLUSTER ANOMALY ALGORITHM
+─────────────────────────────────────
+
+  Step 1: Recency weighting
+    Apply exponential decay to sightings.
+    weight = exp(−decay_rate × days_ago)
+    Default decay_rate=0.05 → sighting 14 days ago has ~50% weight.
+
+  Step 2: DBSCAN clustering
+    Run DBSCAN on target's sightings (eps=50m, min_samples=3).
+    Points labeled −1 are noise → immediate anomaly flag (no cluster fit).
+
+  Step 3: Fallback check
+    If target has fewer than 10 sightings OR DBSCAN finds zero clusters:
+    fall back to single-center detection. Not enough data for multi-cluster.
+
+  Step 4: Per-cluster statistics
+    For each cluster: compute weighted center lat/lon,
+    weighted mean distance, weighted standard deviation.
+
+  Step 5: Nearest-cluster assignment
+    For each non-noise sighting: find nearest cluster center.
+    Measure distance to that center.
+
+  Step 6: Flag anomalies
+    If distance > (mean_dist + n_std × std_dist): flag as anomaly.
+
+
+4.3 SENSITIVITY PARAMETER (n_std)
+───────────────────────────────────
+
+  Conservative (n=3)  Flag only extreme outliers. Must be 3 std beyond
+                      normal range. Few false positives. Best for
+                      high-confidence alerting.
+
+  Moderate (n=2)      Standard statistical outlier threshold. 95% of
+                      normal behavior within range. Balanced. DEFAULT.
+
+  Aggressive (n=1)    Flags subtle deviations. 68% of normal behavior
+                      within range. Many flags, requires analyst triage.
+                      Best for exploratory analysis.
+
+
+4.4 ANOMALY REASON CLASSIFICATION
+───────────────────────────────────
+
+  no_cluster_fit         DBSCAN labeled point as noise (label=−1).
+                         Does not belong to any dense cluster.
+                         Highest-confidence anomaly.
+
+  outside_cluster_range  Point belongs to a cluster but distance from
+                         cluster center exceeds threshold.
+                         True outlier from known behavior.
+
+  single_center_fallback Too few sightings for multi-cluster mode.
+                         Used single-center approach. Lower confidence.
+
+
+4.5 RECENCY DECAY
+──────────────────
+
+  Formula: weight = exp(−decay_rate × days_ago)
+
+  decay_rate = 0.01   Slow decay. 69-day half-life. Long memory.
+                      Good for stable targets with fixed routines.
+
+  decay_rate = 0.05   14-day half-life. Balanced. DEFAULT.
+
+  decay_rate = 0.20   3.5-day half-life. Short memory. Best for
+                      rapidly changing behavior.
+
+  The home range reflects who the target is now, not months ago.
+  A target that changes routine will have new behavior weighted
+  appropriately without requiring a manual reset.
+
+
+4.6 HOME RANGE OVERLAY METHODS
+────────────────────────────────
+
+  IQR Box    Bounding box from 10th–90th percentile of weighted lat/lon.
+             Simple, fast. Conservative — never groups points further than
+             requested. Works well for rectangular movement patterns.
+             Can mislead for corridor/elongated movement.
+
+  DBSCAN     Density-based clustering of sightings, then convex hull
+  Hull       around the largest cluster. Better for irregular shapes.
+             More precise for non-rectangular home ranges. Sensitive
+             to eps and min_samples parameters.
+
+
+4.7 EXTREME BEHAVIORS
+──────────────────────
+
+  SCENARIO                    | EFFECT
+  ──────────────────────────────────────────────────────────────────────
+  Fewer than 10 sightings     | Falls back to single-center. Less reliable.
+  One tight cluster           | Works perfectly. Precise flagging.
+  3+ regular locations        | Multi-cluster correctly separates home,
+                              |   work, gym etc. No cross-location noise.
+  Very high decay (0.5+)      | Range based on last 1–2 days. Unstable.
+                              |   Known locations flagged if not recently
+                              |   visited.
+  Very low decay (0.001)      | Old behavior weighted equally. Target who
+                              |   moved cities 6 months ago still has old
+                              |   city in "normal range."
+
+
+================================================================================
+5. DWELL DETECTION
+================================================================================
+
+Flags locations where a single target was observed repeatedly above a
+minimum visit threshold. Suggests places of significance: home, workplace,
+regular meeting point, or routine stop.
+
+
+5.1 ALGORITHM
+──────────────
+
+  Groups sightings by (target, neighborhood_id) — boundary-aware.
+  Counts visits per neighborhood.
+  Filters by minimum visit threshold.
+  Computes first/last seen and average coordinates.
+
+  Using neighborhood_id (not location_id) means two visits to the same
+  location that land in adjacent hexes still count as one dwell spot.
+  15m GPS drift does not create false splits.
+
+
+5.2 RELATIONSHIP TO ROUTINES
+──────────────────────────────
+
+  Dwell and Routines are complementary, not redundant:
+
+  Dwell Detection:
+    WHERE does target repeatedly return?
+    Answer: Location + visit count.
+    Example: "Target 3 keeps returning to this corner."
+
+  Routine Detection:
+    WHERE + WHEN does target repeatedly appear?
+    Answer: Location + time block + day of week + count.
+    Example: "Target 3 is at that corner every Monday 08:00–10:00."
+
+  A dwell location is a prerequisite for a routine, but not every dwell
+  location has a detectable routine (target may visit at random times).
+
+
+5.3 EXTREME BEHAVIORS
+──────────────────────
+
+  min_visits = 2      Almost all locations flagged. High noise. For
+                      exploration only, not actionable intelligence.
+
+  min_visits = 5+     Only most significant locations surface. High
+                      confidence. May miss real locations with few sightings.
+
+  Sparse data         Dwell detection unreliable with fewer than ~20
+  (<20 sightings)     total sightings per target.
+
+  High-frequency      Works well. Multiple dwell locations correctly
+  targets (100+)      identified. Significant vs incidental clearly
+                      separated.
+
+
+================================================================================
+6. ROUTINE DETECTION
+================================================================================
+
+The most actionable output in the system. A confirmed routine means you
+can predict where a target will be before they arrive.
+
+
+6.1 ALGORITHM
+──────────────
+
+  A routine is flagged when:
+    same target + same neighborhood + same 2-hour time block +
+    same day of week appears at or above the minimum occurrence threshold.
+
+  Components:
+    Location grouping:  neighborhood_label (boundary-aware, ~20m tolerance)
+    Time bucketing:     hour = (hour // 2) * 2
+                        e.g. 09:34 → 08:00–10:00 block
+    Day of week:        strftime('%A') — Monday through Sunday
+    Min occurrences:    User-configurable. Lower = more noise.
+
+  Why 2-hour blocks?
+    Coarse enough to capture GPS time imprecision and natural variation
+    (target arrives 08:15 one week, 08:45 the next). Fine enough to
+    distinguish morning vs afternoon behavior.
+
+
+6.2 EXTREME BEHAVIORS
+──────────────────────
+
+  min_occurrences = 2   Many patterns including coincidental repetition.
+                        High noise. Use for exploration.
+
+  min_occurrences = 5+  Only strong confirmed routines. Low noise. May
+                        miss real but infrequent patterns.
+
+  No routines found     Either truly random behavior or insufficient data.
+                        Absence of routines is itself analytically
+                        significant.
+
+  Many routines found   Highly predictable target. Strong intelligence
+                        value. Cross-reference with dwell to identify
+                        most operationally significant locations.
+
+
+================================================================================
+7. TARGET–LOCATION NETWORK GRAPH
+================================================================================
+
+A force-directed graph connecting targets to locations they share. Makes
+relationship structure immediately visible without reading tables.
+
+
+7.1 GRAPH STRUCTURE
+────────────────────
+
+  Target nodes (circles)    One per tracked target. Color matches target
+                            color throughout the app.
+
+  Location nodes (diamonds) One per shared neighborhood_id. Only locations
+                            visited by 2+ targets are shown. Yellow diamonds.
+
+  Edges                     Target → Location: this target was seen here.
+
+  Isolated targets excluded Targets with no shared locations add no
+                            relationship value and increase visual noise.
+
+
+7.2 INTERPRETATION
+───────────────────
+
+  Two targets → same location node   They share that location. More shared
+                                     nodes = stronger implied relationship.
+
+  Highly connected location node     Hotspot visited by many targets. May
+                                     be a meeting point or high-traffic area.
+
+  Target with many location links    Wide-ranging target. Many distinct
+                                     neighborhoods visited.
+
+
+7.3 IMPORTANT CAVEAT
+─────────────────────
+
+  Shared location ≠ Meeting.
+
+  A shared location means targets visited the same place. They may have
+  been there at completely different times. Always cross-reference with
+  Convergence Detection (temporal proximity) before concluding a meeting
+  occurred.
+
+
+================================================================================
+8. TEMPORAL ANALYSIS
+================================================================================
+
+Time-based behavioral analysis. Answers when targets are active and
+whether their schedules overlap.
+
+
+8.1 HOUR × DAY HEATMAP
+────────────────────────
+
+  A matrix of hour of day (0–23) × day of week (Mon–Sun).
+  Each cell = sighting count at that time slot. Color = count.
+
+  Per-target view    Individual schedule analysis. Reveals personal
+                     patterns: morning commuter, night owl, weekend-only.
+
+  Combined view      All selected targets overlaid. Bright cells shared
+                     across targets = same active period. Cross-reference
+                     with convergence to check co-location.
+
+
+8.2 WHAT TO LOOK FOR
+─────────────────────
+
+  Bright cluster at consistent time  High-confidence routine. Same time
+                                     every week. Corroborates routine
+                                     detection algorithm.
+
+  Isolated bright cell               One-off at unusual time. Potentially
+                                     anomalous. Worth investigating.
+
+  Dark rows/columns                  Target never active at that time.
+                                     Negative evidence — useful for ruling
+                                     out scenarios.
+
+  Two targets identical patterns     Same active periods. Strong indicator
+                                     of shared schedule. Combine with
+                                     convergence and shared locations.
+
+
+================================================================================
+9. DISTANCE CALCULATIONS
+================================================================================
+
+
+9.1 HAVERSINE FORMULA
+──────────────────────
+
+  All distance measurements use the Haversine formula — actual ground
+  distance between two GPS coordinates accounting for Earth's curvature.
+
+  Why not Euclidean?
+    Simple coordinate subtraction treats the Earth as flat. At short
+    distances (<1km) the error is small but consistent. For surveillance
+    where 10m matters, Haversine is the correct choice.
+
+  Formula:
+    d = 2R × arcsin(√(sin²(Δφ/2) + cos(φ₁)·cos(φ₂)·sin²(Δλ/2)))
+
+  Where:
+    R = 6,371,000m (Earth radius)
+    φ = latitude in radians
+    λ = longitude in radians
+
+  Two implementations:
+
+  Scalar version     Single point-to-point calculation. Used in clustering
+                     loops and fallback code.
+
+  Vectorized version Origin is scalar, targets are a Pandas Series.
+                     NumPy operations throughout. O(n), no Python loop.
+                     Used everywhere performance matters.
+
+
+9.2 DISTANCE TRAVELED (TARGET SUMMARY)
+────────────────────────────────────────
+
+  Computed as the sum of Haversine distances between consecutive sightings
+  in chronological order — a chained distance approximating total path length.
+
+  Note: This is the distance between recorded sightings, not the actual
+  route traveled. A target could have taken any path between two sighting
+  points. The chained distance is a lower bound on actual movement.
+
+
+================================================================================
+10. HOW FEATURES INTERACT
+================================================================================
+
+No feature in GeoMap is designed to be used in isolation. The system is
+designed for cross-referencing — each feature raises a question that
+another feature answers.
+
+
+10.1 CROSS-REFERENCE MAP
+─────────────────────────
+
+  FINDING                              | CROSS-REFERENCE WITH
+  ─────────────────────────────────────────────────────────────────────────
+  Shared location found                | Convergence Detection — were they
+                                       |   there at the same time?
+  Convergence event found              | Routines — is this a scheduled
+                                       |   meeting or coincidence?
+  Anomaly detected                     | Convergence — was another target
+                                       |   present at that location?
+  Routine confirmed                    | Dwell — is this one of the target's
+                                       |   established home locations?
+  Network shows strong link            | Convergence with tight time window
+                                       |   to confirm actual meetings.
+  Two targets share active hours       | Convergence Detection — were they
+                                       |   also in the same location?
+  High-speed movement detected         | Cross-reference timestamps and
+                                       |   locations — vehicle or GPS error?
+
+
+10.2 RECOMMENDED INVESTIGATION WORKFLOW
+─────────────────────────────────────────
+
+  1. Target Intelligence Cards
+     Establish baseline profile. Sightings, active days, distance traveled,
+     last known location.
+
+  2. Shared Locations (Network tab)
+     Identify which targets share neighborhoods. This is the relationship map.
+
+  3. Convergence Detection (50m / 60 min)
+     Confirm which shared locations are actual meetings.
+
+  4. Temporal Analysis — Combined view
+     Do converging targets share active periods consistently?
+
+  5. Routines
+     Are the meetings scheduled? Is there a predictable pattern?
+
+  6. Anomaly Detection
+     Any targets visiting unusual locations? Cross-reference with convergence.
+
+  7. Animation tab
+     Visualize multiple targets simultaneously. Look for coordinated movement.
+
+
+10.3 CONFIDENCE HIERARCHY
+──────────────────────────
+
+  From highest to lowest analytical confidence:
+
+  1 (Highest)  Convergence: same_cell + dt ≤ 15 min
+               Two targets in same ~10m hex within 15 minutes. Near certainty.
+
+  2            Convergence: adjacent_cell + dt ≤ 30 min
+               Within ~20m, within 30 minutes. High confidence.
+
+  3            Routine detected (5+ occurrences)
+               Repeated predictable behavior. High confidence in pattern.
+
+  4            Shared location (neighborhood_id)
+               Same ~20m area, any time. Does NOT confirm meeting.
+
+  5            Network graph connection
+               Structural indicator only. Requires temporal verification.
+
+  6 (Lowest)   Heatmap overlap
+               Same active hours. Does NOT confirm co-location.
+
+
+================================================================================
+11. PERFORMANCE & SCALE
+================================================================================
+
+
+11.1 COMPLEXITY SUMMARY
+─────────────────────────
+
+  Operation                  | Complexity    | Notes
+  ───────────────────────────────────────────────────────────────────────
+  H3 hex assignment          | O(n)          | Vectorized. < 1s at 1M rows
+  Neighborhood ID            | O(n)          | Cached ring lookups
+  Dwell detection            | O(n)          | Groupby aggregation
+  Shared locations           | O(n)          | Groupby aggregation
+  Routines                   | O(n)          | Groupby with time bucketing
+  Convergence pre-filter     | O(n)          | H3 hex grouping + neighbors
+  Convergence haversine      | O(candidates) | Only on hex-neighborhood matches
+  Anomaly (multi-cluster)    | O(n log n)    | DBSCAN + per-cluster stats
+  Home range computation     | O(n)          | Vectorized weighted stats
+  Network graph rendering    | O(nodes+edges)| Browser-side, PyVis
+
+
+11.2 SCALE LIMITS
+──────────────────
+
+  < 10,000 rows           All features smooth. No optimization needed.
+
+  10,000–100,000 rows     Precompute takes 10–60 seconds. UI instant.
+                          Recommended for production use.
+
+  100,000–1,000,000 rows  Precompute takes minutes. UI reads instant.
+                          Convergence pre-filter critical at this scale.
+
+  > 1,000,000 rows        Precompute may take 10–30 minutes. Consider
+                          incremental per-target recomputation. UI instant.
+
+
+11.3 INCREMENTAL PIPELINE
+──────────────────────────
+
+  The pipeline detects new rows by comparing total row count against the
+  last_processed.json state file.
+
+  Why full reprocess (not append-only)?
+
+  New sightings can:
+  - Change existing clusters (new point near hex boundary may shift
+    neighborhood_id of existing points)
+  - Affect routine detection (new sighting completes a pattern)
+  - Change home range statistics
+
+  Incremental append would produce stale analytical outputs.
+
+
+================================================================================
+12. QUICK REFERENCE
+================================================================================
+
+
+12.1 KEY PARAMETERS
+────────────────────
+
+  Parameter              | Default | Description
+  ──────────────────────────────────────────────────────────────────────────
+  H3_RESOLUTION          | 12      | ~10m hex cells. Location clustering.
+  H3_RESOLUTION_CONV     | 9       | ~174m hex cells. Convergence pre-filter.
+  H3_NEIGHBOR_RINGS      | 1       | k=1 rings for neighborhood_id. ~20m tol.
+  H3_CONV_RINGS          | 2       | k=2 rings for convergence. Covers ~600m.
+  MAX_CONV_METERS        | 500     | Max convergence distance stored.
+  MAX_CONV_MINUTES       | 240     | Max time delta stored (4 hours).
+  decay_rate             | 0.05    | Exponential decay. 14-day half-life.
+  eps_meters (anomaly)   | 50      | DBSCAN epsilon for anomaly detection.
+  min_samples (anomaly)  | 3       | Minimum cluster size for DBSCAN.
+  min_sightings (anomaly)| 10      | Below this → single-center fallback.
+
+
+12.2 FILE REFERENCE
+────────────────────
+
+  utils/clustering.py
+    H3, grid, DBSCAN methods. neighborhood_id. Convergence pre-filter
+    + haversine verify. Benchmark utility.
+
+  utils/precompute.py
+    Full pipeline runner. Computes all parquet outputs. Incremental detection.
+
+  utils/data.py
+    All load_*() functions. Anomaly detection. Home range. Heatmap subsampling.
+
+  utils/network.py
+    PyVis graph. Filters to shared locations only.
+
+  data/precomputed/clusters.parquet
+    H3 clustered sightings with location_id and neighborhood_id.
+
+  data/precomputed/dwell.parquet
+    Per-target dwell locations (grouped by neighborhood_id).
+
+  data/precomputed/shared_locations.parquet
+    Locations visited by 2+ targets.
+
+  data/precomputed/routines.parquet
+    Detected behavioral patterns.
+
+  data/precomputed/convergences.parquet
+    All pairs ≤ 500m and ≤ 240 min. Filter at query time.
+
+  data/precomputed/target_summary.parquet
+    Per-target profile stats.
+
+  data/precomputed/home_ranges.json
+    Nested dict — not tabular, stored as JSON.
+    {target: {center_lat, center_lon, mean_dist, std_dist}}
+
+  data/precomputed/last_processed.json
+    Pipeline state: {rows_processed, timestamp}
+
+
+12.3 WHAT USES NEIGHBORHOOD_ID VS LOCATION_ID
+───────────────────────────────────────────────
+
+  Uses neighborhood_id (boundary-aware, ~20m tolerance):
+    - Dwell detection
+    - Shared location analysis
+    - Routine detection
+    - Network graph
+
+  Uses location_id (exact hex, ~10m):
+    - Convergence distance_type classification (same_cell check)
+    - Cluster visualization tab
+
+  Uses raw lat/lon (not hex-based):
+    - Heatmap
+    - Home range overlay (IQR box, DBSCAN hull)
+    - Anomaly detection (haversine to cluster center)
+    - Distance traveled (haversine chain)
+    - Timeline, paths, animation
+
+
+================================================================================
+© 2026 GeoMap · Internal Reference Document
+================================================================================
