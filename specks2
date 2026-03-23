@@ -1,0 +1,52 @@
+ANOMALY DETECTION — DESIGN ISSUE & PROPOSED FIX
+GeoMap · Internal Spec · March 2026
+
+CURRENT DESIGN — THE PROBLEM
+get_anomalies_multicluster() lives in data.py and is called directly from the Tracker page at render time. Every time a user moves the sensitivity slider, changes the decay rate, or switches targets, Streamlit reruns the page and the full function executes again. This means DBSCAN, the recency weight calculation, the per-cluster statistics, and the haversine distance loops all run live in the browser session.
+This violates the core architectural contract of the system, which is explicit in the reference doc and in precompute.py's own docstring: all heavy computation belongs in the precompute pipeline. Streamlit pages are supposed to be read-only consumers of parquet files. Anomaly detection is the only major feature that breaks this rule.
+The performance consequence is direct. DBSCAN is O(n log n). The per-cluster assignment loop iterates over every non-noise point and calls haversine_vectorized once per cluster per point — that inner loop is pure Python, not vectorized. At 10k points per target with 12 targets, this is already slow enough to be noticeable. At 50k total points it becomes painful. At 100k+ it is unusable as an interactive feature.
+There is a secondary design problem. The function accepts eps_meters, min_samples, and decay_rate as parameters, but the Tracker page calls it with hardcoded values (eps_meters=50.0, min_samples=3) while exposing decay_rate and sensitivity (n_std) as UI sliders. This means the parameters that actually control cluster shape are frozen at render time, while only the threshold parameter (n_std) is user-adjustable. The architecture implies flexibility that does not exist.
+
+WHY n_std IS DIFFERENT FROM THE OTHER PARAMETERS
+This is the key insight the fix depends on.
+eps_meters, min_samples, and decay_rate all affect cluster shape — which points belong to which cluster, where the cluster center lands, what the weighted standard deviation is. If any of these change, you have to re-run DBSCAN and recompute all statistics from scratch.
+n_std does not affect cluster shape at all. It only controls where the anomaly threshold sits relative to already-computed statistics. The threshold is just arithmetic:
+threshold = mean_dist_m + n_std × std_dist_m
+If mean_dist_m and std_dist_m are already stored, applying a different n_std is a single vectorized column operation on a dataframe. It is O(n) and takes milliseconds regardless of dataset size.
+This means the expensive work (DBSCAN, weight calculation, cluster statistics, per-point distances) can be fully precomputed and stored. The cheap work (threshold comparison) stays in the UI layer where it belongs.
+
+PROPOSED FIX
+Split the current function into two responsibilities.
+Part 1 — Precompute (runs once, in precompute.py)
+Add _compute_anomalies() to the pipeline. It runs DBSCAN with fixed parameters (eps=50m, min_samples from config), computes recency weights, assigns every point to its nearest cluster, and stores the following columns per point in anomalies.parquet:
+target, last_seen, lat, lon,
+cluster_id, anomaly_reason,
+cluster_center_lat, cluster_center_lon,
+dist_from_center, mean_dist_m, std_dist_m
+Points labeled as noise by DBSCAN get cluster_id = -1 and anomaly_reason = no_cluster_fit. Their dist_from_center is stored as NaN — they are always anomalies regardless of n_std. Points that fall under single_center_fallback are also computed and stored with anomaly_reason = single_center_fallback.
+The n_std threshold is deliberately not applied here. All points get their distance stored. The UI decides what counts as anomalous.
+Part 2 — Runtime filter (runs on every UI interaction, in data.py)
+Replace get_anomalies_multicluster() with filter_anomalies(n_std, decay_rate). It reads anomalies.parquet (cached by Streamlit), then applies:
+is_anomaly = dist_from_center > (mean_dist_m + n_std × std_dist_m)
+OR anomaly_reason == "no_cluster_fit"
+This is a vectorized boolean mask on a parquet read. It is O(1) from the user's perspective at any scale.
+
+THE decay_rate PROBLEM
+decay_rate is the awkward case. It affects cluster shape (recency weighting changes which points pull the cluster center), so it cannot be resolved at query time like n_std can.
+There are two honest options.
+Option A — Fix decay_rate at precompute time. Remove it from the UI slider. Document the chosen value (0.05, 14-day half-life) as a pipeline parameter that requires a recompute to change. This matches how every other pipeline parameter works. The UI slider is giving users false control — changing decay_rate in the current implementation does rerun DBSCAN live, which is the exact performance problem being fixed.
+Option B — Precompute multiple decay_rate snapshots. Run _compute_anomalies() three times (slow/medium/fast decay) and store three parquet files. The UI slider becomes a selector between precomputed results. Adds precompute time, adds storage, but preserves interactivity. Only worth it if analysts genuinely need to compare decay rates in the field.
+Recommendation is Option A. The 14-day half-life is appropriate for the stated use case. If a target's behavior has changed, the analyst should re-run precompute with fresh data — not adjust a decay slider and hope the live DBSCAN finishes before they lose patience.
+
+WHAT STAYS IN THE UI
+After this change, the only anomaly-related control that runs computation at render time is the n_std threshold comparison — one vectorized operation on a cached dataframe. The sensitivity slider becomes genuinely instant. The map redraws immediately. The anomaly table updates without a visible delay.
+eps_meters, min_samples, and decay_rate become pipeline parameters documented in precompute.py, adjustable only by re-running the pipeline. This is the correct design for parameters that affect analytical foundations rather than display preferences.
+
+SUMMARY TABLE
+Parameter        | Current behavior          | Proposed behavior
+─────────────────────────────────────────────────────────────────
+n_std            | Reruns DBSCAN live        | Vectorized filter on parquet
+decay_rate       | Reruns DBSCAN live        | Fixed at precompute time
+eps_meters       | Hardcoded, no UI          | Pipeline parameter (no change)
+min_samples      | Hardcoded, no UI          | Pipeline parameter (no change)
+sensitivity      | Slow slider               | Instant slider
