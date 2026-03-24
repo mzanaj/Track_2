@@ -53,3 +53,11 @@ Now the implementation:Created 4 files, viewed a file, read a fileCreated 4 file
 3 — data_additions.py — add load_anomalies() alongside the other load_* loaders, add filter_anomalies(). Remove get_anomalies_multicluster(), _fallback_single_center(), _ANOMALY_COLS, and get_dbscan_hulls().
 4 — tracker_page_changes.py — the most surgical change. The 4-column control row becomes a 2-column row. The get_anomalies_multicluster() call becomes filter_anomalies(). The DBSCAN hull block is deleted. Everything else in Tab 1 is untouched.
 After integrating, run python -m utils.precompute --force once to generate anomalies.parquet. From that point the slider is instant at any data scale.
+
+
+####
+Minor suggestions (all optional, none blockers)
+
+Multiple k-ring matches (edge case): If a sighting's k-ring overlaps two dwells, your current spec takes "any" match. I'd make build_dwell_lookup() / _get_dwell_center() pick the highest visit_count (i.e. lowest anomaly score) so you're never over-flagging on a borderline point. Super cheap to do with a quick max() in the ring check.
+Hard-anomaly distance column (nice-to-have for v1.1): Adding distance_meters_to_nearest_dwell (even if just for hard anomalies) would give analysts instant context ("this is 450m from their nearest known spot"). Easy H3 distance calc during precompute.
+Time decay (future v2): Old dwells from 2023 still count as "known territory" forever right now. If you ever want to age them out, we can add a simple exponential decay on visit_count based on last_seen—but totally out of scope for now.
