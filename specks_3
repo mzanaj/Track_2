@@ -1,0 +1,55 @@
+Let me write the spec first, then the code.
+
+ANOMALY DETECTION REDESIGN — SPEC & IMPLEMENTATION
+GeoMap · March 2026
+
+WHAT CHANGES AND WHY
+The current get_anomalies_multicluster() runs DBSCAN live at render time, violating the precompute contract. It is replaced entirely by a dwell-lookup approach that is simpler, faster, and more interpretable. The core insight from the POC: the dwell table is already the compressed representation of where a target belongs. Anomaly detection is a lookup against that table, not a clustering problem.
+The DBSCAN-based approach is removed. No distance-from-center arithmetic, no per-cluster statistics, no n_std slider, no fallback single-center logic.
+
+ANOMALY SCORING MODEL
+A sighting is scored as follows:
+Step 1 — H3 cell lookup. Convert the sighting's lat/lon to an H3 cell at resolution 12. Expand to a k-ring of radius H3_ANOMALY_RINGS (default 1, ~20m tolerance). Check whether any cell in that ring matches any cell in the target's established dwell set.
+Step 2 — Hard anomaly. If no match is found, the point is in a location the target has never meaningfully visited. Score = 1.0. Type = hard.
+Step 3 — Soft anomaly. If a match is found, retrieve the visit count of the matched dwell location. Score = 1 / visit_count. A location visited twice scores 0.50. A location visited 20 times scores 0.05. The soft anomaly threshold is applied at query time in the UI — not during precompute.
+Step 4 — Normal. If score is below the UI threshold, the point is normal. Not stored in the anomaly output — the full scored table is stored and the UI filters it.
+This means precompute stores every sighting with its score. The UI slider is a filter on a column. No recomputation ever happens at render time.
+
+PIPELINE PARAMETERS (fixed at precompute time)
+H3_ANOMALY_RES     = 12      Same resolution as clustering. ~10m cells.
+H3_ANOMALY_RINGS   = 1       k=1 neighbor ring. ~20m GPS tolerance.
+DWELL_MIN_VISITS   = 3       Minimum visits to establish a location.
+                              Below this, visits don't count as known territory.
+These live in clustering.py alongside the existing H3 constants. Changing them requires a recompute — same contract as all other pipeline parameters.
+
+UI PARAMETER (live, O(1) filter)
+soft_threshold     slider 0.05–1.0, default 0.50
+                   Points with score >= threshold shown as soft anomaly.
+                   Points with score == 1.0 always shown (hard anomaly).
+Operationally: threshold 0.50 means "flag any location visited fewer than 2 times." Threshold 0.10 means "flag any location visited fewer than 10 times." This is intuitive to an analyst — it maps directly to visit count.
+
+OUTPUT SCHEMA — anomalies.parquet
+target                  int
+last_seen               datetime
+lat                     float
+lon                     float
+score                   float       1/visit_count, or 1.0 for hard
+anomaly_type            str         'hard' | 'soft_candidate'
+nearest_dwell_lat       float       NaN for hard anomalies
+nearest_dwell_lon       float       NaN for hard anomalies
+nearest_dwell_visits    int         0 for hard anomalies
+h3_cell                 str         cell of this sighting
+Note: all sightings with score > 0 (i.e. not in a well-established location) are stored. Normal sightings — those that land in a well-visited dwell zone — are not stored. The table is small by design.
+
+FILES CHANGED
+utils/clustering.py     Add 3 constants. Add build_dwell_lookup().
+utils/precompute.py     Add _compute_anomalies(). Call it in run().
+utils/data.py           Add filter_anomalies(). Remove get_anomalies_multicluster().
+pages/1_Tracker.py      Replace anomaly call. Simplify UI controls.
+
+Now the implementation:Created 4 files, viewed a file, read a fileCreated 4 files, viewed a file, read a fileFour files, each scoped to exactly one part of the codebase. Here's the integration order:
+1 — clustering_additions.py — drop the 3 constants into the top of clustering.py alongside your existing H3 constants, then add build_dwell_lookup() as a new function. No changes to existing functions.
+2 — precompute_additions.py — update the import line, add _compute_anomalies() and its helper _get_dwell_center(), then add _compute_anomalies(clustered) as the last call in run().
+3 — data_additions.py — add load_anomalies() alongside the other load_* loaders, add filter_anomalies(). Remove get_anomalies_multicluster(), _fallback_single_center(), _ANOMALY_COLS, and get_dbscan_hulls().
+4 — tracker_page_changes.py — the most surgical change. The 4-column control row becomes a 2-column row. The get_anomalies_multicluster() call becomes filter_anomalies(). The DBSCAN hull block is deleted. Everything else in Tab 1 is untouched.
+After integrating, run python -m utils.precompute --force once to generate anomalies.parquet. From that point the slider is instant at any data scale.
